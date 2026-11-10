@@ -1,0 +1,15 @@
+# 데이터 (용량 큼, README의 다운로드 방법으로 재현)
+data/
+
+# 모델 산출물
+*.pt
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# OS
+.DS_Store

@@ -19,4 +19,5 @@ mkdir -p data/raw && curl -L -o data/raw/criteo_attribution_dataset.tsv.gz https
 python src/prepare_data.py
 python src/train.py
 python src/export_onnx.py
+python src/simulator.py
 ```

@@ -60,6 +60,13 @@ def fit_encoders(df: pd.DataFrame) -> dict:
     return {"vocab": vocab, "tslc_mean": float(tslc.mean()), "tslc_std": float(tslc.std())}
 
 
+def load_encoders(path: Path = ART / "encoders.json") -> dict:
+    """JSON 은 dict 키를 문자열로 저장하므로 vocab 키를 int 로 되돌린다."""
+    enc = json.loads(path.read_text())
+    enc["vocab"] = {c: {int(k): v for k, v in m.items()} for c, m in enc["vocab"].items()}
+    return enc
+
+
 def encode(df: pd.DataFrame, enc: dict) -> tuple[np.ndarray, np.ndarray]:
     """범주형 인덱스 (n, 10) int64, 수치형 (n, 2) float32."""
     cats = np.stack([

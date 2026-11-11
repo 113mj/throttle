@@ -18,4 +18,5 @@ pCVR 예측 모델을 제어 루프(PID)에 연결해 광고 예산 소진을 �
 mkdir -p data/raw && curl -L -o data/raw/criteo_attribution_dataset.tsv.gz https://huggingface.co/datasets/criteo/criteo-attribution-dataset/resolve/main/criteo_attribution_dataset.tsv.gz
 python src/prepare_data.py
 python src/train.py
+python src/export_onnx.py
 ```

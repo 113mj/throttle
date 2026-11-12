@@ -20,4 +20,5 @@ python src/prepare_data.py
 python src/train.py
 python src/export_onnx.py
 python src/simulator.py
+python src/run_experiments.py
 ```

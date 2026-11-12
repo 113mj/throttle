@@ -82,8 +82,8 @@ def build_market(pred_col: str, score: str = "p_per_cost") -> Market:
 
 
 def simulate(market: Market, make: Callable[[object, Market], Controller]) -> dict:
-    """반환: log (캠페인 x 일 x 구간 기록), conversions (캠페인별 전환 수)."""
-    rows, conversions = [], {}
+    """반환: log (캠페인 x 일 x 구간 기록), conversions (캠페인별 전환 수), daily (캠페인 x 일)."""
+    rows, conversions, daily = [], {}, []
     for c in market.campaigns:
         ctrl = make(c, market)
         budget, target = market.budget[c], market.target[c]
@@ -93,6 +93,7 @@ def simulate(market: Market, make: Callable[[object, Market], Controller]) -> di
             day = market.data[c][d]
             b = day["k_bounds"]
             remaining = budget
+            n_before = len(conv_ids)
             ctrl.start_day()
             for k in range(N_INT):
                 sl = slice(b[k], b[k + 1])
@@ -108,11 +109,16 @@ def simulate(market: Market, make: Callable[[object, Market], Controller]) -> di
                 ctrl.update(Step(k, spent_frac, target[k], inc[k + 1] if k + 1 < N_INT else 0.0,
                                  remaining, score, cost))
             ctrl.end_day()
+            day_ids = np.concatenate(conv_ids[n_before:])
+            daily.append((c, d, int(np.unique(day_ids[day_ids != -1]).size)))
         ids = np.concatenate(conv_ids)
         conversions[c] = int(np.unique(ids[ids != -1]).size)
     log = pd.DataFrame(rows, columns=["campaign", "day", "k", "threshold", "shown", "impressions",
                                       "spend", "spent_frac", "target_frac"])
-    return {"log": log, "conversions": conversions}
+    # 날짜별 전환은 그날 안에서만 중복 제거 (날짜를 넘는 중복은 conversions 쪽에서 제거됨)
+    daily = pd.DataFrame(daily, columns=["campaign", "day", "conversions"])
+    daily = daily.merge(log.groupby(["campaign", "day"], as_index=False).spend.sum())
+    return {"log": log, "conversions": conversions, "daily": daily}
 
 
 def summarize(result: dict, market: Market) -> dict:

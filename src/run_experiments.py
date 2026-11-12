@@ -7,6 +7,7 @@
 2. 캘리브레이션: 정확한 / 부풀려진 / 보정한 모델을 컨트롤러에 넣었을 때
 3. PID 게인 (Kp, Ki, Kd) 에 따른 소진 곡선 안정성
 4. 전환율 급락: 실제 드리프트 캠페인 + 인위적 급락(3개 캠페인, 25일차부터 전환 50% 제거)
+5. 모델 개선 -> 제어 성과: 이력 피처 모델을 PID 에 넣었을 때 (src/train_features.py 먼저 실행)
 """
 import copy
 import sys
@@ -31,8 +32,8 @@ SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#6250d6", "#eda100"]
 
 
 @lru_cache(maxsize=None)
-def market(pred: str) -> Market:
-    return build_market(pred)
+def market(pred: str, preds_file: str = "preds.parquet") -> Market:
+    return build_market(pred, preds_file=preds_file)
 
 
 def run(m: Market, make) -> tuple[dict, dict]:
@@ -314,7 +315,55 @@ def exp4() -> None:
     save(fig, "exp4_shock.png")
 
 
-EXPERIMENTS = {"1": exp1, "2": exp2, "3": exp3, "4": exp4}
+# ---------------------------------------------------------------- 실험 5
+
+FEATURE_MODELS = {
+    "cost_only": "no model (score = 1 / cost)",
+    "base": "base MLP",
+    "+history": "+ user history",
+    "+history+hour+cost": "+ history + hour + cost",
+    "lasttouch": "base, last-touch label",
+    "+history lasttouch": "+ history, last-touch label",
+    "oracle": "oracle (true label)",
+}
+
+
+def exp5() -> None:
+    print("\n[실험 5] 모델 개선 -> 제어 성과 (PID, 확률 크기가 달라도 스스로 맞춘다)")
+    metrics = pd.read_csv(REPORTS / "exp5_model_metrics.csv")
+    auc = metrics[metrics.split == "test"].set_index("variant").auc
+    rows = []
+    for pred in FEATURE_MODELS:
+        m = market(pred, "preds_features.parquet")
+        _, s = run(m, CONTROLLERS["pid"])
+        rows.append({"model": pred, "auc": auc.get(pred, np.nan), **s})
+    table = pd.DataFrame(rows)
+    base = table.set_index("model").loc["base"]
+    table["conv_vs_base"] = table.conversions / base.conversions - 1
+    lo, hi = table.set_index("model").conversions[["cost_only", "oracle"]]
+    table["share_of_gap"] = (table.conversions - lo) / (hi - lo)   # 바닥(0) ~ 천장(1) 중 위치
+    for col in ("conv_label_sum", "conv_last_touch"):
+        table[col + "_vs_base"] = table[col] / base[col] - 1
+    show(table[["model", "auc", "conversions", "conv_vs_base", "share_of_gap", "impr_per_conversion",
+                "conv_label_sum", "conv_label_sum_vs_base", "conv_last_touch", "conv_last_touch_vs_base",
+                "cpa_x1000", "budget_used", "pacing_mae_pp", "early_depletion"]], "exp5_features.csv")
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.2), facecolor=SURFACE)
+    t = table.iloc[::-1]
+    gain = 100 * t.conv_vs_base
+    labels = [FEATURE_MODELS[m] + (f"  (AUC {a:.3f})" if pd.notna(a) else "") for m, a in zip(t.model, t.auc)]
+    bars = ax.barh(labels, gain, color=[SERIES[0] if g >= 0 else SERIES[1] for g in gain], height=0.6)
+    for b, g in zip(bars, gain):
+        ax.text(g, b.get_y() + b.get_height() / 2, f" {g:+.1f}% " if g else " base ",
+                va="center", ha="left" if g >= 0 else "right", color=INK2)
+    ax.axvline(0, color=INK2, lw=1)
+    ax.set_xlim(gain.min() - 3, gain.max() + 3)
+    axes(ax, "Unique conversions vs base MLP (PID, same budget)", "conversions vs base (%)", "")
+    ax.grid(axis="y", visible=False)
+    save(fig, "exp5_features.png")
+
+
+EXPERIMENTS = {"1": exp1, "2": exp2, "3": exp3, "4": exp4, "5": exp5}
 
 if __name__ == "__main__":
     FIG.mkdir(parents=True, exist_ok=True)

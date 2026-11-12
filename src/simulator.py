@@ -9,7 +9,8 @@
   score="p" 로 바꾸면 pCVR 만 본다. 비싼 노출일수록 pCVR 이 높아서 무작위보다 CPA 가 나쁘다
 - 기준 임계값: val 기간(18~20일차)에 보정 없는 일반 MLP 로, 실제 비용의 BUDGET_RATIO
   만큼을 보여주게 되는 점수 값. 확률 단위로 고정해 두고 모델만 바꿔 끼운다.
-- 전환: 보여준 노출에 연결된 conversion_id 를 캠페인별로 중복 없이 센다
+- 전환: 보여준 노출에 연결된 conversion_id 를 캠페인별로 중복 없이 센다 (기본)
+  비교용으로 노출별 라벨 합(중복 포함), 마지막 노출만 인정(last-touch)도 함께 센다
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,11 +47,15 @@ def score_of(p, cost, score: str):
     return p / cost if score == "p_per_cost" else p
 
 
-def build_market(pred_col: str, score: str = "p_per_cost") -> Market:
+def build_market(pred_col: str, score: str = "p_per_cost", preds_file: str = "preds.parquet") -> Market:
     df = pd.read_parquet(ROOT / "data/sample.parquet",
-                         columns=["timestamp", "day", "campaign", "cost", "conversion_id", "split"])
-    preds = pd.read_parquet(ROOT / "artifacts/preds.parquet").set_index("row_id")
+                         columns=["timestamp", "day", "campaign", "cost", "conversion",
+                                  "conversion_id", "split"])
+    preds = pd.read_parquet(ROOT / "artifacts" / preds_file).set_index("row_id")
     df["k"] = (df.timestamp % DAY) // INTERVAL
+    conv = df[df.conversion_id != -1]
+    df["last_touch"] = 0
+    df.loc[conv.groupby("conversion_id").timestamp.idxmax(), "last_touch"] = 1
 
     # 목표 곡선: train 기간 시간대별 비용 비중
     train = df[df.split == "train"]
@@ -76,6 +81,7 @@ def build_market(pred_col: str, score: str = "p_per_cost") -> Market:
         data.setdefault(c, {})[d] = {
             "k_bounds": np.searchsorted(g.k.to_numpy(), np.arange(N_INT + 1)),
             "score": g.s.to_numpy(), "cost": g.cost.to_numpy(), "conv_id": g.conversion_id.to_numpy(),
+            "label": g.conversion.to_numpy(), "last": g.last_touch.to_numpy(),
         }
     campaigns = sorted(data)
     return Market(campaigns, data, budget, {c: target.loc[c].to_numpy() for c in campaigns}, tau)
@@ -83,12 +89,12 @@ def build_market(pred_col: str, score: str = "p_per_cost") -> Market:
 
 def simulate(market: Market, make: Callable[[object, Market], Controller]) -> dict:
     """반환: log (캠페인 x 일 x 구간 기록), conversions (캠페인별 전환 수), daily (캠페인 x 일)."""
-    rows, conversions, daily = [], {}, []
+    rows, conversions, daily, credit = [], {}, [], {}
     for c in market.campaigns:
         ctrl = make(c, market)
         budget, target = market.budget[c], market.target[c]
         inc = np.diff(np.concatenate([[0.0], target]))
-        conv_ids = []
+        conv_ids, label_sum, last_sum = [], 0, 0
         for d in SIM_DAYS:
             day = market.data[c][d]
             b = day["k_bounds"]
@@ -104,6 +110,8 @@ def simulate(market: Market, make: Callable[[object, Market], Controller]) -> di
                 spend = float(cost[shown].sum())
                 remaining -= spend
                 conv_ids.append(day["conv_id"][sl][shown])
+                label_sum += int(day["label"][sl][shown].sum())
+                last_sum += int(day["last"][sl][shown].sum())
                 spent_frac = 1.0 - remaining / budget
                 rows.append((c, d, k, tau, int(shown.sum()), len(score), spend, spent_frac, target[k]))
                 ctrl.update(Step(k, spent_frac, target[k], inc[k + 1] if k + 1 < N_INT else 0.0,
@@ -113,12 +121,13 @@ def simulate(market: Market, make: Callable[[object, Market], Controller]) -> di
             daily.append((c, d, int(np.unique(day_ids[day_ids != -1]).size)))
         ids = np.concatenate(conv_ids)
         conversions[c] = int(np.unique(ids[ids != -1]).size)
+        credit[c] = (label_sum, last_sum, int((ids != -1).sum()))
     log = pd.DataFrame(rows, columns=["campaign", "day", "k", "threshold", "shown", "impressions",
                                       "spend", "spent_frac", "target_frac"])
     # 날짜별 전환은 그날 안에서만 중복 제거 (날짜를 넘는 중복은 conversions 쪽에서 제거됨)
     daily = pd.DataFrame(daily, columns=["campaign", "day", "conversions"])
     daily = daily.merge(log.groupby(["campaign", "day"], as_index=False).spend.sum())
-    return {"log": log, "conversions": conversions, "daily": daily}
+    return {"log": log, "conversions": conversions, "daily": daily, "credit": credit}
 
 
 def summarize(result: dict, market: Market) -> dict:
@@ -128,6 +137,7 @@ def summarize(result: dict, market: Market) -> dict:
     conv = sum(result["conversions"].values())
     cd = log.groupby(["campaign", "day"])
     early = cd.apply(lambda g: bool((g.spent_frac >= 0.99).to_numpy()[:EARLY_K].any()), include_groups=False)
+    label_sum, last_sum, conv_impr = np.array(list(result["credit"].values())).sum(axis=0)
     return {
         "conversions": conv,
         "spend": spend,
@@ -136,6 +146,9 @@ def summarize(result: dict, market: Market) -> dict:
         "shown_share": log.shown.sum() / log.impressions.sum(),
         "pacing_mae_pp": 100 * (log.spent_frac - log.target_frac).abs().mean(),
         "early_depletion": float(early.mean()),
+        "conv_label_sum": int(label_sum),        # 노출별 라벨 합 (같은 전환을 여러 번 셈)
+        "conv_last_touch": int(last_sum),        # 전환 직전 마지막 노출만 인정
+        "impr_per_conversion": conv_impr / max(conv, 1),  # 얻은 전환 1개당 보여준 전환 노출 수
     }
 
 

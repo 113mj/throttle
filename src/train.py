@@ -119,9 +119,9 @@ def downsample_negatives(n_rows: int, y: np.ndarray, rate: float) -> np.ndarray:
     return np.flatnonzero(keep)
 
 
-def train_mlp(sizes, fit_x, fit_y, val_x, val_y, logit_offset: float = 0.0) -> PCVRNet:
+def train_mlp(sizes, fit_x, fit_y, val_x, val_y, logit_offset: float = 0.0, n_num: int = 2) -> PCVRNet:
     """logit_offset: early stopping 판단 시 val 로짓에 더할 값 (다운샘플링 보정용)."""
-    model = PCVRNet(sizes)
+    model = PCVRNet(sizes, n_num)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = nn.BCEWithLogitsLoss()
     cats, num = map(torch.from_numpy, fit_x)

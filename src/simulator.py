@@ -50,7 +50,7 @@ def score_of(p, cost, score: str):
 def build_market(pred_col: str, score: str = "p_per_cost", preds_file: str = "preds.parquet") -> Market:
     df = pd.read_parquet(ROOT / "data/sample.parquet",
                          columns=["timestamp", "day", "campaign", "cost", "conversion",
-                                  "conversion_id", "split"])
+                                  "conversion_id", "conversion_timestamp", "split"])
     preds = pd.read_parquet(ROOT / "artifacts" / preds_file).set_index("row_id")
     df["k"] = (df.timestamp % DAY) // INTERVAL
     conv = df[df.conversion_id != -1]
@@ -73,7 +73,8 @@ def build_market(pred_col: str, score: str = "p_per_cost", preds_file: str = "pr
         tau[c] = float(g.s.iloc[np.searchsorted(cum.to_numpy(), BUDGET_RATIO)])
 
     sim = df[df.day.isin(SIM_DAYS)].sort_values("timestamp", kind="stable")
-    sim = sim.assign(s=score_of(preds.loc[sim.index, pred_col].to_numpy(), sim.cost.to_numpy(), score))
+    p = preds.loc[sim.index, pred_col].to_numpy()
+    sim = sim.assign(p=p, s=score_of(p, sim.cost.to_numpy(), score))
     budget = (sim.groupby("campaign").cost.sum() / len(SIM_DAYS) * BUDGET_RATIO).to_dict()
 
     data = {}
@@ -82,6 +83,8 @@ def build_market(pred_col: str, score: str = "p_per_cost", preds_file: str = "pr
             "k_bounds": np.searchsorted(g.k.to_numpy(), np.arange(N_INT + 1)),
             "score": g.s.to_numpy(), "cost": g.cost.to_numpy(), "conv_id": g.conversion_id.to_numpy(),
             "label": g.conversion.to_numpy(), "last": g.last_touch.to_numpy(),
+            "p": g.p.to_numpy(), "ts": g.timestamp.to_numpy(),
+            "conv_ts": g.conversion_timestamp.to_numpy(),
         }
     campaigns = sorted(data)
     return Market(campaigns, data, budget, {c: target.loc[c].to_numpy() for c in campaigns}, tau)
@@ -112,11 +115,12 @@ def simulate(market: Market, make: Callable[[object, Market], Controller]) -> di
                 conv_ids.append(day["conv_id"][sl][shown])
                 label_sum += int(day["label"][sl][shown].sum())
                 last_sum += int(day["last"][sl][shown].sum())
+                ctrl.observe({k: day[k][sl][shown] for k in ("ts", "p", "label", "conv_ts")})
                 spent_frac = 1.0 - remaining / budget
                 rows.append((c, d, k, tau, int(shown.sum()), len(score), spend, spent_frac, target[k]))
                 ctrl.update(Step(k, spent_frac, target[k], inc[k + 1] if k + 1 < N_INT else 0.0,
                                  remaining, score, cost))
-            ctrl.end_day()
+            ctrl.end_day((d + 1) * DAY)
             day_ids = np.concatenate(conv_ids[n_before:])
             daily.append((c, d, int(np.unique(day_ids[day_ids != -1]).size)))
         ids = np.concatenate(conv_ids)

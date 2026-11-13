@@ -9,6 +9,7 @@
 4. 전환율 급락: 실제 드리프트 캠페인 + 인위적 급락(3개 캠페인, 25일차부터 전환 50% 제거)
 5. 모델 개선 -> 제어 성과: 이력 피처 모델을 PID 에 넣었을 때 (src/train_features.py 먼저 실행)
 6. 신뢰구간: 실험 1, 2, 5 의 주요 차이를 캠페인 단위 / 날짜 단위 블록 부트스트랩으로
+7. 지연 보정 성과 피드백: 효율 하한선 + 하루 1번 "관측 전환 / 기대 관측 전환" 으로 점수 보정
 """
 import copy
 import sys
@@ -19,12 +20,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from controllers import PID, FixedThreshold, Pacing
+from controllers import PID, FeedbackPID, FixedThreshold, Pacing
 from simulator import (CONTROLLERS, N_INT, SIM_DAYS, Market, build_market, plot_curves,
                        simulate, summarize)
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORTS = ROOT / "reports"
+DAY = 86400
 FIG = REPORTS / "figures"
 SEED = 42
 
@@ -247,10 +249,15 @@ def shocked_market(base: Market, campaigns: list) -> Market:
         for d in SIM_DAYS:
             if d < SHOCK_DAY:
                 continue
-            ids = m.data[c][d]["conv_id"]
+            day = m.data[c][d]
+            ids = day["conv_id"]
             uniq = np.unique(ids[ids != -1])
             dropped = uniq[rng.random(uniq.size) < SHOCK_DROP]
-            m.data[c][d]["conv_id"] = np.where(np.isin(ids, dropped), -1, ids)
+            gone = np.isin(ids, dropped)
+            day["conv_id"] = np.where(gone, -1, ids)
+            day["label"] = np.where(gone, 0, day["label"])
+            day["last"] = np.where(gone, 0, day["last"])
+            day["conv_ts"] = np.where(gone, -1, day["conv_ts"])
     return m
 
 
@@ -460,7 +467,113 @@ def exp6() -> None:
     save(fig, "exp6_bootstrap.png")
 
 
-EXPERIMENTS = {"1": exp1, "2": exp2, "3": exp3, "4": exp4, "5": exp5, "6": exp6}
+# ---------------------------------------------------------------- 실험 7
+
+FLOOR_K = 0.7   # 효율 하한선 = 기준 임계값 x 0.7 (평소엔 거의 안 걸리고, 효율이 크게 나빠지면 걸리는 수준)
+
+
+def delay_cdf():
+    """학습 기간 전환 노출의 '노출 -> 전환' 지연 누적분포 F(초)."""
+    df = pd.read_parquet(ROOT / "data/sample.parquet",
+                         columns=["timestamp", "conversion_timestamp", "conversion", "split"])
+    t = df[(df.split == "train") & (df.conversion == 1)]
+    lags = np.sort((t.conversion_timestamp - t.timestamp).to_numpy())
+    return lambda x: np.searchsorted(lags, x, side="right") / lags.size
+
+
+class ShockOracle(FeedbackPID):
+    """급락 날짜와 크기를 아는 경우: 급락 캠페인은 25일차부터 점수 x (1 - drop)."""
+    def __init__(self, tau0, floor, shocked, **kw):
+        super().__init__(tau0, floor, mode="none", **kw)
+        self.shocked, self.day = shocked, SIM_DAYS[0] - 1
+
+    def start_day(self) -> None:
+        super().start_day()
+        self.day += 1
+        self.ratio = 1 - SHOCK_DROP if self.shocked and self.day >= SHOCK_DAY else 1.0
+
+
+def exp7() -> None:
+    print("\n[실험 7] 지연 보정 성과 피드백 루프")
+    base = market("mlp")
+    shocked = sorted(base.budget, key=base.budget.get, reverse=True)[:3]
+    scenarios = {"no shock": base, "shock": shocked_market(base, shocked)}
+    cdf = delay_cdf()
+    print("  관측 비율 F: 1일 %.0f%%, 3일 %.0f%%, 7일 %.0f%%" % tuple(100 * cdf(d * DAY) for d in (1, 3, 7)))
+
+    def makers(scn):
+        fl = lambda mk, c: FLOOR_K * mk.tau[c]
+        return {
+            "pid": lambda c, mk: PID(mk.tau[c]),
+            "pid+floor": lambda c, mk: FeedbackPID(mk.tau[c], fl(mk, c), mode="none"),
+            "pid+floor+naive": lambda c, mk: FeedbackPID(mk.tau[c], fl(mk, c), mode="naive"),
+            "pid+floor+delay": lambda c, mk: FeedbackPID(mk.tau[c], fl(mk, c), mode="delay", delay_cdf=cdf),
+            "pid+floor+delay+baseline": lambda c, mk: FeedbackPID(mk.tau[c], fl(mk, c), mode="delay",
+                                                                  delay_cdf=cdf, baseline_days=3),
+            "oracle": lambda c, mk: ShockOracle(mk.tau[c], fl(mk, c), scn == "shock" and c in shocked),
+        }
+
+    rows, ratios, daily_all = [], [], []
+    for scn, m in scenarios.items():
+        for name, make in makers(scn).items():
+            ctrls = {}
+            r = simulate(m, lambda c, mk, make=make: ctrls.setdefault(c, make(c, mk)))
+            d = r["daily"]
+            sh, rest = d[d.campaign.isin(shocked)], d[~d.campaign.isin(shocked)]
+            after = sh[sh.day >= SHOCK_DAY]
+            conv = pd.Series(r["conversions"])
+            budget = pd.Series(m.budget) * len(SIM_DAYS)
+            drift = [c for c in DRIFT_CAMPAIGNS if c not in shocked]
+            rows.append({
+                "scenario": scn, "controller": name,
+                "shocked_after_spend_per_day": after.spend.sum() / after.day.nunique(),
+                "shocked_after_cpa_x1000": 1000 * after.spend.sum() / after.conversions.sum(),
+                "others_conversions": int(conv.drop(shocked).sum()),
+                "others_budget_used": rest.spend.sum() / budget.drop(shocked).sum(),
+                "others_cpa_x1000": 1000 * rest.spend.sum() / conv.drop(shocked).sum(),
+                "drift_budget_used": d[d.campaign.isin(drift)].spend.sum() / budget[drift].sum(),
+                "drift_cpa_x1000": 1000 * d[d.campaign.isin(drift)].spend.sum() / conv[drift].sum(),
+                "all_conversions": int(conv.sum()),
+                "all_spend": d.spend.sum(),
+                "all_cpa_x1000": 1000 * d.spend.sum() / conv.sum(),
+            })
+            for c, ctrl in ctrls.items():
+                for day, ratio in zip(SIM_DAYS, getattr(ctrl, "ratios", [])):
+                    ratios.append({"scenario": scn, "controller": name, "campaign": c,
+                                   "shocked": c in shocked, "end_of_day": day, "ratio": ratio})
+            daily_all.append(sh.groupby("day").spend.sum().reset_index().assign(scenario=scn, controller=name))
+    show(pd.DataFrame(rows), "exp7_feedback.csv")
+    ratios = pd.DataFrame(ratios)
+    ratios.to_csv(REPORTS / "exp7_ratios.csv", index=False)
+    med = ratios.groupby(["scenario", "controller", "shocked", "end_of_day"]).ratio.median().unstack("end_of_day")
+    print("  하루 끝 보정 비율 (캠페인 중앙값, 다음 날 점수에 곱함):")
+    print(med.round(2).to_string())
+
+    daily_all = pd.concat(daily_all)
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.2), facecolor=SURFACE)
+    names = ["pid+floor+naive", "pid+floor+delay", "pid+floor+delay+baseline", "oracle"]
+    for name, col in zip(names, (SERIES[1], SERIES[0], SERIES[2], SERIES[3])):
+        t = ratios[(ratios.scenario == "shock") & (ratios.controller == name) & ratios.shocked]
+        if name == "oracle":
+            t = pd.DataFrame({"end_of_day": SIM_DAYS,
+                              "ratio": [1 - SHOCK_DROP if d + 1 >= SHOCK_DAY else 1.0 for d in SIM_DAYS]})
+        g = t.groupby("end_of_day").ratio.median()
+        g = g[g.index + 1 <= SIM_DAYS[-1]]          # 하루 끝 비율은 다음 날 적용된다
+        a1.plot(g.index + 1, g.values, "-o", color=col, lw=2, ms=4, label=name)
+    for name, col in zip(["pid", *names], (SERIES[4], SERIES[1], SERIES[0], SERIES[2], SERIES[3])):
+        t = daily_all[(daily_all.scenario == "shock") & (daily_all.controller == name)]
+        a2.plot(t.day, t.spend, "-o", color=col, lw=2, ms=4, label=name)
+    for a in (a1, a2):
+        a.axvline(SHOCK_DAY - 0.5, color=INK2, ls="--", lw=1)
+        a.set_xticks(SIM_DAYS)
+    axes(a1, "Correction ratio applied each day (shocked campaigns)", "day applied", "score multiplier")
+    axes(a2, "Shocked campaigns: daily spend", "day", "spend")
+    a1.legend(frameon=False, labelcolor=INK2, loc="upper right", fontsize=8)
+    a2.legend(frameon=False, labelcolor=INK2, loc="center left", fontsize=8)
+    save(fig, "exp7_feedback.png")
+
+
+EXPERIMENTS = {"1": exp1, "2": exp2, "3": exp3, "4": exp4, "5": exp5, "6": exp6, "7": exp7}
 
 if __name__ == "__main__":
     FIG.mkdir(parents=True, exist_ok=True)

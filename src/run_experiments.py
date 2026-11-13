@@ -8,6 +8,7 @@
 3. PID 게인 (Kp, Ki, Kd) 에 따른 소진 곡선 안정성
 4. 전환율 급락: 실제 드리프트 캠페인 + 인위적 급락(3개 캠페인, 25일차부터 전환 50% 제거)
 5. 모델 개선 -> 제어 성과: 이력 피처 모델을 PID 에 넣었을 때 (src/train_features.py 먼저 실행)
+6. 신뢰구간: 실험 1, 2, 5 의 주요 차이를 캠페인 단위 / 날짜 단위 블록 부트스트랩으로
 """
 import copy
 import sys
@@ -363,7 +364,103 @@ def exp5() -> None:
     save(fig, "exp5_features.png")
 
 
-EXPERIMENTS = {"1": exp1, "2": exp2, "3": exp3, "4": exp4, "5": exp5}
+# ---------------------------------------------------------------- 실험 6
+
+N_BOOT = 2000
+
+
+def units(r: dict, m: Market, by: str) -> pd.DataFrame:
+    """캠페인 또는 날짜 단위 합계. 전환은 캠페인 단위면 9일 전체 중복 제거, 날짜 단위면 그날 안에서 중복 제거."""
+    log = r["log"].assign(err=(r["log"].spent_frac - r["log"].target_frac).abs())
+    early = log.groupby(["campaign", "day"]).apply(
+        lambda g: float((g.spent_frac >= 0.99).to_numpy()[:88].any()), include_groups=False).rename("early")
+    u = log.groupby(by).agg(spend=("spend", "sum"), err_sum=("err", "sum"), n_int=("err", "size"))
+    u["early"] = early.groupby(by).sum()
+    u["n_cd"] = early.groupby(by).size()
+    if by == "campaign":
+        u["conv"] = pd.Series(r["conversions"])
+    else:
+        u["conv"] = r["daily"].groupby("day").conversions.sum()
+    return u
+
+
+def boot_weights(n: int, seed: int) -> np.ndarray:
+    """(N_BOOT, n) 각 단위가 몇 번 뽑혔는지. 0번째 행은 원래 표본(전부 1번)."""
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, (N_BOOT, n))
+    w = np.stack([np.bincount(row, minlength=n) for row in idx]).astype(float)
+    return np.vstack([np.ones(n), w])
+
+
+def exp6() -> None:
+    print("\n[실험 6] 신뢰구간 (블록 부트스트랩, %d회)" % N_BOOT)
+    runs = {}
+    mlp = market("mlp")
+    for name in ("fixed", "pacing", "pid"):
+        runs[("mlp", name)] = simulate(mlp, CONTROLLERS[name])
+    ds = market("mlp_ds")
+    for name in ("fixed", "pacing", "pid"):
+        runs[("mlp_ds", name)] = simulate(ds, CONTROLLERS[name])
+    mults = np.geomspace(0.25, 4, 17)
+    for i, mult in enumerate(mults):
+        runs[("front", i)] = simulate(mlp, lambda c, mk, mult=mult: FixedThreshold(mk.tau[c] * mult))
+    for pred in ("base", "+history", "lasttouch", "cost_only"):
+        runs[("feat", pred)] = simulate(market(pred, "preds_features.parquet"), CONTROLLERS["pid"])
+
+    rows = []
+    for by, seed in (("campaign", SEED), ("day", SEED + 1)):
+        U = {k: units(r, mlp, by) for k, r in runs.items()}
+        order = U[("mlp", "pid")].index
+        U = {k: u.reindex(order) for k, u in U.items()}
+        W = boot_weights(len(order), seed)
+        S = lambda k, col: W @ U[k][col].to_numpy()   # (N_BOOT+1,) 표본별 합계
+
+        conv = lambda k: S(k, "conv")
+        cpa = lambda k: S(k, "spend") / S(k, "conv")
+        front_spend = np.stack([S(("front", i), "spend") for i in range(len(mults))], axis=1)
+        front_conv = np.stack([S(("front", i), "conv") for i in range(len(mults))], axis=1)
+        pid_spend = S(("mlp", "pid"), "spend")
+        same_spend = np.array([np.interp(x, fs[::-1], fc[::-1])   # 배율이 커질수록 지출이 줄어든다
+                               for x, fs, fc in zip(pid_spend, front_spend, front_conv)])
+        mae = lambda k: S(k, "err_sum") / S(k, "n_int")
+        early = lambda k: S(k, "early") / S(k, "n_cd")
+
+        metrics = {
+            "exp1 PID vs fixed: conversions": conv(("mlp", "pid")) / conv(("mlp", "fixed")) - 1,
+            "exp1 PID vs fixed at same spend: conversions": conv(("mlp", "pid")) / same_spend - 1,
+            "exp1 PID vs best fixed: conversions": conv(("mlp", "pid")) / front_conv.max(axis=1) - 1,
+            "exp1 PID vs fixed: pacing error": mae(("mlp", "pid")) / mae(("mlp", "fixed")) - 1,
+            "exp1 PID - fixed: early depletion (pp)": 100 * (early(("mlp", "pid")) - early(("mlp", "fixed"))),
+            "exp2 inflated model, fixed: CPA": cpa(("mlp_ds", "fixed")) / cpa(("mlp", "fixed")) - 1,
+            "exp2 inflated model, pacing: CPA": cpa(("mlp_ds", "pacing")) / cpa(("mlp", "pacing")) - 1,
+            "exp2 inflated model, PID: CPA": cpa(("mlp_ds", "pid")) / cpa(("mlp", "pid")) - 1,
+            "exp5 last-touch label vs base: conversions": conv(("feat", "lasttouch")) / conv(("feat", "base")) - 1,
+            "exp5 +history vs base: conversions": conv(("feat", "+history")) / conv(("feat", "base")) - 1,
+            "exp5 cost only vs base: conversions": conv(("feat", "cost_only")) / conv(("feat", "base")) - 1,
+        }
+        for name, v in metrics.items():
+            scale = 1 if "(pp)" in name else 100
+            lo, hi = np.percentile(v[1:], [2.5, 97.5])
+            rows.append({"metric": name, "resample_by": by, "n_units": len(order),
+                         "estimate": scale * v[0], "ci_low": scale * lo, "ci_high": scale * hi,
+                         "excludes_zero": bool(lo > 0 or hi < 0)})
+    table = pd.DataFrame(rows)
+    show(table, "exp6_bootstrap.csv")
+
+    t = table[table.resample_by == "campaign"].iloc[::-1]
+    fig, ax = plt.subplots(figsize=(9, 5.2), facecolor=SURFACE)
+    y = np.arange(len(t))
+    col = [SERIES[0] if z else SERIES[1] for z in t.excludes_zero]
+    ax.hlines(y, t.ci_low, t.ci_high, color=col, lw=3)
+    ax.plot(t.estimate, y, "o", color=INK, ms=5)
+    ax.axvline(0, color=INK2, lw=1)
+    ax.set_yticks(y, [m.replace(": ", "\n") for m in t.metric], fontsize=8)
+    axes(ax, "95% CI, campaign block bootstrap (orange = includes 0)", "change (%, or pp for early depletion)", "")
+    ax.grid(axis="y", visible=False)
+    save(fig, "exp6_bootstrap.png")
+
+
+EXPERIMENTS = {"1": exp1, "2": exp2, "3": exp3, "4": exp4, "5": exp5, "6": exp6}
 
 if __name__ == "__main__":
     FIG.mkdir(parents=True, exist_ok=True)
